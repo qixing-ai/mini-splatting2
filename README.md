@@ -7,7 +7,7 @@ For technical details, please refer to:
 
 **Mini-Splatting2: Building 360 Scenes within Minutes via Aggressive Gaussian Densification**  <br />
 Guangchi Fang and Bing Wang.<br />
-**[[Paper](https://arxiv.org/pdf/2403.14166.pdf)]** <br />
+**[[Paper](https://arxiv.org/pdf/2411.12788)]** <br />
 
 
 
