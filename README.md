@@ -61,7 +61,7 @@ python full_eval.py -m360 <mipnerf360 folder> -tat <tanks and temples folder> -d
 
 ### (3) Mini-Splatting2-D (Dense Gaussians)
 
-Training scripts for Mini-Splatting2-D are in `msv2`:
+Training scripts for Mini-Splatting2-D are in `msv2_d`:
 ```
 cd msv2_d
 ```
