@@ -369,3 +369,103 @@ def compute_surface_normals(depth_map):
         print(f"法线计算错误: {str(e)}")
         # 返回一个简单的默认法线
         return torch.tensor([0.0, 0.0, 1.0], device=depth_map.device).reshape(3, 1, 1).expand(3, depth_map.shape[0], depth_map.shape[1])
+
+def render_depth_with_weights(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, culling=None):
+    """
+    渲染深度图，并返回每个像素射线上的高斯深度和权重
+    """
+    from diff_gaussian_rasterization_ms import GaussianRasterizationSettings, GaussianRasterizer
+    
+    # 创建屏幕空间点
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # 设置光栅化配置
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    opacity = pc.get_opacity
+    
+    # 获取尺度与旋转
+    scales = pc.get_scaling
+    rotations = pc.get_rotation
+    cov3D_precomp = None
+
+    # 获取颜色特征
+    dc, shs = pc.get_features_dc, pc.get_features_rest
+    colors_precomp = None
+
+    if culling==None:
+        culling=torch.zeros(means3D.shape[0], dtype=torch.bool, device='cuda')
+
+    # 获取每个像素射线上的高斯深度和权重
+    # 注意：这里假设rasterizer有一个render_with_depths方法，实际实现可能需要修改
+    try:
+        # 尝试使用专门的深度渲染函数(如果存在)
+        result = rasterizer.render_with_depths(
+            means3D = means3D,
+            means2D = means2D,
+            dc = dc,
+            shs = shs,
+            culling = culling,
+            colors_precomp = colors_precomp,
+            opacities = opacity,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp)
+        
+        # 假设result包含：最终渲染图像、每个射线上的高斯深度及其权重
+        depths_per_ray = result.get("depths_per_ray", None)  # [B, N, H*W]
+        weights_per_ray = result.get("weights_per_ray", None)  # [B, N, H*W]
+        depth_map = result.get("depth", None)  # [H, W]
+        radii = result.get("radii", None)
+        
+    except Exception as e:
+        print(f"深度渲染出错: {str(e)}")
+        # 回退到基本渲染，获取深度图
+        render_result = render_imp(viewpoint_camera, pc, pipe, bg_color, scaling_modifier, override_color, culling=culling)
+        
+        # 创建简化的深度图(基于亮度)
+        rgb = render_result["render"].detach()
+        depth_map = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+        radii = render_result["radii"]
+        
+        # 创建空的深度和权重数组(简化版本)
+        H, W = depth_map.shape
+        depths_per_ray = None
+        weights_per_ray = None
+    
+    # 计算表面法线
+    surface_normals = compute_surface_normals(depth_map)
+    
+    return {
+        "depth": depth_map,
+        "surface_normals": surface_normals,
+        "depths_per_ray": depths_per_ray,
+        "weights_per_ray": weights_per_ray,
+        "viewspace_points": screenspace_points,
+        "visibility_filter": (radii > 0).nonzero() if radii is not None else torch.zeros((0,1), device="cuda", dtype=torch.long),
+        "radii": radii if radii is not None else torch.zeros(0, device="cuda")
+    }

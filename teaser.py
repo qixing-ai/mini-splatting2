@@ -69,21 +69,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
     gaussians.init_culling(len(scene.getTrainCameras()))
-
-    # 修改默认值，使法线约束立即生效
-    normal_loss_weight = getattr(args, 'normal_loss_weight', 0.05)
-    enable_normal_loss = getattr(args, 'enable_normal_loss', True)  # 默认开启
-    normal_loss_start_iter = getattr(args, 'normal_loss_start_iter', 500)  # 开始较早
-    
-    # 打印法线约束设置信息
-    print(f"法线约束设置: 启用={enable_normal_loss}, 权重={normal_loss_weight}, 开始迭代={normal_loss_start_iter}")
     
     # 添加内存管理参数
-    memory_cleanup_interval = 100  # 每隔多少次迭代清理一次内存
-    max_points_limit = getattr(args, 'max_points_limit', 1000000)  # 限制高斯点数量
+    memory_cleanup_interval = 100
+    max_points_limit = getattr(args, 'max_points_limit', 1000000)
     
-    for iteration in range(first_iter, opt.iterations + 1):
-        # 每隔一定迭代次数强制清理GPU内存
+    # 设置损失权重参数
+    normal_loss_weight = getattr(args, 'normal_loss_weight', 0.1)
+    depth_loss_weight = getattr(args, 'depth_loss_weight', 0.01)
+    enable_normal_loss = getattr(args, 'enable_normal_loss', True)
+    enable_depth_loss = getattr(args, 'enable_depth_loss', True)
+    normal_loss_start_iter = getattr(args, 'normal_loss_start_iter', 1000)
+    depth_loss_start_iter = getattr(args, 'depth_loss_start_iter', 2000)
+    normal_loss_threshold = getattr(args, 'normal_loss_threshold', 2.0)
+    
+    # 打印初始配置信息
+    print(f"法线约束: 启用={enable_normal_loss}, 权重={normal_loss_weight}, 开始迭代={normal_loss_start_iter}, 阈值={normal_loss_threshold}")
+    print(f"深度集中约束: 启用={enable_depth_loss}, 权重={depth_loss_weight}, 开始迭代={depth_loss_start_iter}")
+
+    # 自动调整法线损失权重
+    if enable_normal_loss and getattr(args, 'normal_loss_auto_adjust', True):
+        adjusted_normal_weight = normal_loss_weight * 0.5
+        print(f"法线约束权重自动调整: {normal_loss_weight} -> {adjusted_normal_weight}")
+        normal_loss_weight = adjusted_normal_weight
+
+    # 初始化total_loss变量
+    total_loss = torch.tensor(0.0, device="cuda")
+
+    for iteration in range(first_iter, opt.iterations + 1):   
+        # 确保在每次迭代开始时记录开始事件
+        iter_start.record()
+
         if iteration % memory_cleanup_interval == 0:
             torch.cuda.empty_cache()
             print(f"[内存管理] 迭代 {iteration}: 强制清理GPU缓存")
@@ -101,8 +117,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mask = torch.zeros(gaussians._xyz.shape[0], dtype=torch.bool, device="cuda")
             mask[keep_indices] = True
             
+            # 记录剪枝前的点数
+            original_point_count = gaussians._xyz.shape[0]
+            
             # 剪枝
             gaussians.prune_points(~mask)
+            
+            # 重置mask_blur以匹配新的点数
+            mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
+            
             print(f"[内存管理] 迭代 {iteration}: 剪枝后高斯点数量: {gaussians._xyz.shape[0]}")
         
         if network_gui.conn == None:
@@ -120,10 +143,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
 
+        # 确保在此处记录开始事件
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-
 
         if iteration % 1000 == 0 and iteration>args.simp_iteration1:
             gaussians.oneupSHdegree()
@@ -146,16 +169,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         photo_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
-        # 计算法线损失
+        # 初始化约束损失
         normal_loss = torch.tensor(0.0, device="cuda")
-        if enable_normal_loss and iteration > normal_loss_start_iter:
+        depth_loss = torch.tensor(0.0, device="cuda")
+        
+        # 计算额外约束损失
+        if (enable_normal_loss and iteration > normal_loss_start_iter) or (enable_depth_loss and iteration > depth_loss_start_iter):
             try:
                 with torch.no_grad():
-                    # 获取渲染图像的灰度值作为简单深度估计
+                    # 从渲染图像获取深度估计
                     rgb = render_pkg["render"].detach()
                     depth_map = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
                     
-                    # 使用修复后的函数计算表面法线
+                    # 计算表面法线
                     surface_normals = compute_surface_normals(depth_map)
                     
                     # 创建深度包
@@ -165,40 +191,73 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     }
                 
                 # 计算法线一致性损失
-                normal_loss = compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussians)
+                if enable_normal_loss and iteration > normal_loss_start_iter:
+                    normal_loss = compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussians)
+                    if not torch.isfinite(normal_loss) or normal_loss > normal_loss_threshold:
+                        print(f"[警告] 迭代 {iteration}: 法线损失值异常({normal_loss.item():.4f})，使用0.0替代")
+                        normal_loss = torch.tensor(0.0, device="cuda")
                 
-                if not torch.isfinite(normal_loss) or normal_loss.numel() > 1:
-                    normal_loss = torch.tensor(0.0, device="cuda")
+                # 计算深度集中损失
+                if enable_depth_loss and iteration > depth_loss_start_iter:
+                    depth_loss = compute_simplified_depth_concentration_loss(depth_pkg)
+                    if not torch.isfinite(depth_loss) or depth_loss > 1.0:
+                        print(f"[警告] 迭代 {iteration}: 深度损失值异常({depth_loss.item():.4f})，使用0.0替代")
+                        depth_loss = torch.tensor(0.0, device="cuda")
             except Exception as e:
-                print(f"[错误] 迭代 {iteration}: 法线计算错误: {str(e)}")
+                print(f"[错误] 迭代 {iteration}: 约束计算错误: {str(e)}")
                 normal_loss = torch.tensor(0.0, device="cuda")
-        
-        # 构建最终损失 - 始终使用光度损失
-        if normal_loss > 0 and torch.isfinite(normal_loss):
-            # 先反向传播光度损失
-            photo_loss.backward(retain_graph=True)  # 保留计算图以便继续
-            # 再单独反向传播法线损失
-            (normal_loss_weight * normal_loss).backward()
-        else:
-            # 只有光度损失
-            photo_loss.backward()
+                depth_loss = torch.tensor(0.0, device="cuda")
+                torch.cuda.empty_cache()
 
+        # 组合总损失
+        total_loss = photo_loss
+        normal_term = torch.tensor(0.0, device="cuda")
+        depth_term = torch.tensor(0.0, device="cuda")
+        
+        if normal_loss > 0:
+            normal_term = normal_loss_weight * normal_loss
+            total_loss = total_loss + normal_term
+        if depth_loss > 0:
+            depth_term = depth_loss_weight * depth_loss
+            total_loss = total_loss + depth_term
+        
+        # 反向传播
+        total_loss.backward()
+        
+        # 确保在结束时记录结束事件
         iter_end.record()
+        
+        # 同步CUDA流，确保事件被正确记录
+        torch.cuda.synchronize()
 
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * photo_loss.item() + 0.6 * ema_loss_for_log
+            # 进度条更新
+            ema_loss_for_log = 0.4 * total_loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
                     "Loss": f"{ema_loss_for_log:.{7}f}",
-                    "NormLoss": f"{normal_loss.item():.{7}f}"
+                    "NormLoss": f"{normal_loss.item():.{4}f}" if normal_loss > 0 else "0.0",
+                    "DepthLoss": f"{depth_loss.item():.{4}f}" if depth_loss > 0 else "0.0"
                 })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, photo_loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            # 记录和保存（确保事件已被记录）
+            try:
+                # 确保两个事件都已被记录
+                elapsed_time = iter_start.elapsed_time(iter_end) if iteration > 1 else 0.0
+                # 传入法线损失和深度损失
+                training_report(tb_writer, iteration, Ll1, total_loss, l1_loss, elapsed_time, 
+                               testing_iterations, scene, render, (pipe, background), 
+                               normal_loss=normal_loss, depth_loss=depth_loss)
+            except RuntimeError as e:
+                print(f"[警告] 迭代 {iteration}: 无法计算时间: {str(e)}")
+                # 跳过时间记录，直接传递0.0
+                training_report(tb_writer, iteration, Ll1, total_loss, l1_loss, 0.0, 
+                               testing_iterations, scene, render, (pipe, background),
+                               normal_loss=normal_loss, depth_loss=depth_loss)
+                
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -272,7 +331,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 path_save = r'./teaser/%d_s.ply'%iteration
                 gs2ply(gaussians, path_save)                
-                
+            
 
             if iteration == args.simp_iteration2:
                 gaussians.culling_with_interesction_preserving(scene, render_simp, iteration, args, pipe, background)
@@ -331,11 +390,16 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene, renderFunc, renderArgs, normal_loss=None, depth_loss=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
+        # 添加法线和深度损失记录
+        if normal_loss is not None:
+            tb_writer.add_scalar('train_loss_patches/normal_loss', normal_loss.item(), iteration)
+        if depth_loss is not None:
+            tb_writer.add_scalar('train_loss_patches/depth_loss', depth_loss.item(), iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -390,7 +454,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
 def compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussians):
     """
-    计算法线一致性损失 - 简化版本
+    计算法线一致性损失 - 修复异常值问题
     """
     try:
         # 基本检查
@@ -400,12 +464,12 @@ def compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussi
         # 获取表面法线
         surface_normals = depth_pkg["surface_normals"]
         
-        # 计算全局表面法线方向 (平均值)
+        # 计算全局表面法线方向
         avg_normal = torch.mean(surface_normals.reshape(3, -1), dim=1)
         avg_normal = torch.nn.functional.normalize(avg_normal, dim=0)
         
-        # 获取随机采样的高斯点法线
-        max_points = 1000  # 限制点数
+        # 获取高斯法线 - 随机采样以提高效率
+        max_points = 1000  # 限制采样点数
         num_points = min(gaussians._normals.shape[0], max_points)
         indices = torch.randperm(gaussians._normals.shape[0], device='cuda')[:num_points]
         sampled_normals = gaussians.get_normals[indices]
@@ -415,9 +479,20 @@ def compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussi
         camera_normals = torch.matmul(view_matrix, sampled_normals.T).T
         camera_normals = torch.nn.functional.normalize(camera_normals, dim=1)
         
-        # 计算法线一致性损失
+        # 计算法线一致性损失 - 使用余弦相似度
         cos_similarity = torch.sum(camera_normals * avg_normal.unsqueeze(0), dim=1)
-        normal_loss = (1.0 - cos_similarity).mean()
+        
+        # 修复：使用修改后的损失计算方式
+        # 限制余弦值到[-1, 1]范围
+        cos_similarity = torch.clamp(cos_similarity, min=-1.0, max=1.0)
+        
+        # 对应角度小于90度的法线，保持1-cos作为损失
+        # 对于角度大于90度的法线，使用恒定值1.0作为损失（避免惩罚过大）
+        mask = cos_similarity >= 0  # 角度小于90度
+        loss_values = torch.ones_like(cos_similarity)
+        loss_values[mask] = 1.0 - cos_similarity[mask]  # 角度小于90度的部分使用1-cos
+        
+        normal_loss = loss_values.mean()
         
         return normal_loss
     except Exception as e:
@@ -426,56 +501,114 @@ def compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussi
 
 def compute_surface_normals(depth_map):
     """
-    通过深度图计算表面法线 - 避免使用pad函数
+    通过深度图计算表面法线
     """
     if depth_map is None or depth_map.numel() == 0:
         return torch.zeros((3, 1, 1), device="cuda")
     
-    # 获取图像尺寸
-    H, W = depth_map.shape
+    # 使用简单的差分计算梯度
+    # 水平差分
+    dx = torch.zeros_like(depth_map)
+    dx[:, :-1] = depth_map[:, 1:] - depth_map[:, :-1]
+    
+    # 垂直差分
+    dy = torch.zeros_like(depth_map)
+    dy[:-1, :] = depth_map[1:, :] - depth_map[:-1, :]
     
     # 创建法线图
-    normals = torch.zeros((3, H, W), device=depth_map.device)
-    
-    # 使用简单的滑动差分计算梯度
-    # 水平差分(中心差分)
-    dx = torch.zeros_like(depth_map)
-    dx[:, 1:-1] = depth_map[:, 2:] - depth_map[:, :-2]  # 中心点的梯度
-    dx[:, 0] = depth_map[:, 1] - depth_map[:, 0]  # 左边界
-    dx[:, -1] = depth_map[:, -1] - depth_map[:, -2]  # 右边界
-    
-    # 垂直差分(中心差分)
-    dy = torch.zeros_like(depth_map)
-    dy[1:-1, :] = depth_map[2:, :] - depth_map[:-2, :]  # 中心点的梯度
-    dy[0, :] = depth_map[1, :] - depth_map[0, :]  # 上边界
-    dy[-1, :] = depth_map[-1, :] - depth_map[-2, :]  # 下边界
-    
-    # 平滑梯度以减少噪声
-    kernel_size = 3
-    dx = torch.nn.functional.avg_pool2d(
-        dx.unsqueeze(0),  # 添加批次维度
-        kernel_size=kernel_size, 
-        stride=1, 
-        padding=kernel_size//2
-    ).squeeze(0)
-    
-    dy = torch.nn.functional.avg_pool2d(
-        dy.unsqueeze(0),  # 添加批次维度
-        kernel_size=kernel_size, 
-        stride=1, 
-        padding=kernel_size//2
-    ).squeeze(0)
-    
-    # 构建法线
+    normals = torch.zeros((3, depth_map.shape[0], depth_map.shape[1]), device=depth_map.device)
     normals[0] = -dx  # X分量
     normals[1] = -dy  # Y分量
-    normals[2] = torch.ones_like(dx) * 0.1  # Z分量(减小以增强XY平面细节)
+    normals[2] = torch.ones_like(dx) * 0.1  # Z分量（较小值使法线更加平行于表面）
     
     # 归一化
     norm = torch.sqrt(torch.sum(normals**2, dim=0, keepdim=True) + 1e-6)
     normals = normals / norm
     
     return normals
+
+def compute_depth_concentration_loss(depth_pkg):
+    """
+    计算射线上高斯深度集中损失
+    depth_pkg: 包含depths_per_ray和weights_per_ray的字典
+    """
+    # 检查是否有有效的深度和权重数据
+    if depth_pkg is None or "depths_per_ray" not in depth_pkg or depth_pkg["depths_per_ray"] is None:
+        return torch.tensor(0.0, device="cuda")
+    
+    depths_per_ray = depth_pkg["depths_per_ray"]  # [B, N, H*W]
+    weights_per_ray = depth_pkg["weights_per_ray"]  # [B, N, H*W]
+    
+    # 射线数量
+    num_rays = depths_per_ray.shape[-1]
+    # 每个射线上的高斯数量
+    num_gaussians_per_ray = depths_per_ray.shape[1]
+    
+    # 初始化总损失
+    total_loss = torch.tensor(0.0, device="cuda")
+    
+    # 对每个射线计算深度集中损失
+    for ray_idx in range(num_rays):
+        # 获取当前射线上的深度和权重
+        ray_depths = depths_per_ray[0, :, ray_idx]  # [N]
+        ray_weights = weights_per_ray[0, :, ray_idx]  # [N]
+        
+        # 过滤有效的深度和权重(权重不为零)
+        valid_mask = ray_weights > 0
+        valid_depths = ray_depths[valid_mask]
+        valid_weights = ray_weights[valid_mask]
+        
+        # 如果射线上没有有效高斯，跳过
+        if valid_depths.shape[0] <= 1:
+            continue
+        
+        # 计算深度差的绝对值
+        depth_diffs = torch.abs(valid_depths.unsqueeze(1) - valid_depths.unsqueeze(0))  # [M, M]
+        
+        # 计算权重乘积矩阵
+        weight_products = valid_weights.unsqueeze(1) * valid_weights.unsqueeze(0)  # [M, M]
+        
+        # 计算加权深度差
+        weighted_diffs = depth_diffs * weight_products
+        
+        # 对矩阵上三角部分(不包括对角线)求和
+        upper_tri_mask = torch.triu(torch.ones_like(weighted_diffs), diagonal=1).bool()
+        ray_loss = weighted_diffs[upper_tri_mask].sum()
+        
+        # 添加到总损失
+        total_loss += ray_loss
+    
+    # 除以射线数量，得到平均损失
+    if num_rays > 0:
+        total_loss = total_loss / num_rays
+    
+    return total_loss
+
+def compute_simplified_depth_concentration_loss(depth_pkg):
+    """
+    简化版深度集中损失 - 使用深度图的平滑性作为代理
+    """
+    if depth_pkg is None or "depth" not in depth_pkg:
+        return torch.tensor(0.0, device="cuda")
+    
+    depth_map = depth_pkg["depth"]  # [H, W]
+    
+    # 使用简单的前向差分计算梯度，避免额外的维度转换
+    # 水平差分
+    dx = torch.zeros_like(depth_map)
+    dx[:, :-1] = depth_map[:, 1:] - depth_map[:, :-1]
+    
+    # 垂直差分
+    dy = torch.zeros_like(depth_map)
+    dy[:-1, :] = depth_map[1:, :] - depth_map[:-1, :]
+    
+    # 计算梯度幅值
+    grad_magnitude = torch.sqrt(dx**2 + dy**2 + 1e-6)
+    
+    # 鼓励深度平滑(梯度小)
+    depth_loss = grad_magnitude.mean()
+    
+    return depth_loss
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -509,10 +642,17 @@ if __name__ == "__main__":
     parser.add_argument("--simp_iteration2", type=int, default = 8_000)
     parser.add_argument("--sampling_factor", type=float, default = 0.6)
 
-    parser.add_argument("--normal_loss_weight", type=float, default=0.05, help="法线一致性损失的权重")
+    parser.add_argument("--normal_loss_weight", type=float, default=0.1, help="法线一致性损失的权重")
+    parser.add_argument("--depth_loss_weight", type=float, default=0.01, help="深度集中损失的权重")
     parser.add_argument("--enable_normal_loss", action="store_true", help="是否启用法线约束")
-    parser.add_argument("--normal_loss_start_iter", type=int, default=500, help="开始应用法线损失的迭代次数")
-    parser.add_argument("--max_points_limit", type=int, default=1000000, help="高斯点数量上限，超过此值将进行额外剪枝")
+    parser.add_argument("--enable_depth_loss", action="store_true", help="是否启用深度集中约束")
+    parser.add_argument("--normal_loss_start_iter", type=int, default=1000, help="开始应用法线损失的迭代次数")
+    parser.add_argument("--depth_loss_start_iter", type=int, default=2000, help="开始应用深度集中损失的迭代次数")
+    parser.add_argument("--max_points_limit", type=int, default=1000000, help="高斯点数量上限")
+
+    parser.add_argument("--normal_loss_auto_adjust", action="store_true", default=True, help="自动调整法线损失权重")
+    parser.add_argument("--normal_loss_threshold", type=float, default=2.0, help="法线损失异常值阈值")
+    parser.add_argument("--print_loss_interval", type=int, default=100, help="打印详细损失信息的间隔")
 
     args = parser.parse_args(sys.argv[1:])
     args.iterations = args.simp_iteration2
