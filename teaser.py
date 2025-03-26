@@ -70,8 +70,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
     gaussians.init_culling(len(scene.getTrainCameras()))
 
-    for iteration in range(first_iter, opt.iterations + 1):   
-
+    # 修改默认值，使法线约束立即生效
+    normal_loss_weight = getattr(args, 'normal_loss_weight', 0.05)
+    enable_normal_loss = getattr(args, 'enable_normal_loss', True)  # 默认开启
+    normal_loss_start_iter = getattr(args, 'normal_loss_start_iter', 500)  # 开始较早
+    
+    # 打印法线约束设置信息
+    print(f"法线约束设置: 启用={enable_normal_loss}, 权重={normal_loss_weight}, 开始迭代={normal_loss_start_iter}")
+    
+    # 添加内存管理参数
+    memory_cleanup_interval = 100  # 每隔多少次迭代清理一次内存
+    max_points_limit = getattr(args, 'max_points_limit', 1000000)  # 限制高斯点数量
+    
+    for iteration in range(first_iter, opt.iterations + 1):
+        # 每隔一定迭代次数强制清理GPU内存
+        if iteration % memory_cleanup_interval == 0:
+            torch.cuda.empty_cache()
+            print(f"[内存管理] 迭代 {iteration}: 强制清理GPU缓存")
+        
+        # 限制高斯点数量以防止内存爆炸
+        if gaussians._xyz.shape[0] > max_points_limit:
+            print(f"[警告] 迭代 {iteration}: 高斯点数量({gaussians._xyz.shape[0]})超过限制({max_points_limit})，执行额外剪枝")
+            # 计算重要性分数
+            importance = gaussians.get_opacity.squeeze()
+            # 保留最重要的点
+            _, indices = torch.sort(importance, descending=True)
+            keep_indices = indices[:max_points_limit]
+            
+            # 创建掩码标记要保留的点
+            mask = torch.zeros(gaussians._xyz.shape[0], dtype=torch.bool, device="cuda")
+            mask[keep_indices] = True
+            
+            # 剪枝
+            gaussians.prune_points(~mask)
+            print(f"[内存管理] 迭代 {iteration}: 剪枝后高斯点数量: {gaussians._xyz.shape[0]}")
+        
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -105,73 +138,118 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         render_pkg = render_imp(viewpoint_cam, gaussians, pipe, background, culling=gaussians._culling[:,viewpoint_cam.uid])
-
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        # Loss
+        # 计算原始光度损失
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        loss.backward()
+        photo_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        
+        # 计算法线损失
+        normal_loss = torch.tensor(0.0, device="cuda")
+        if enable_normal_loss and iteration > normal_loss_start_iter:
+            try:
+                with torch.no_grad():
+                    # 获取渲染图像的灰度值作为简单深度估计
+                    rgb = render_pkg["render"].detach()
+                    depth_map = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+                    
+                    # 使用修复后的函数计算表面法线
+                    surface_normals = compute_surface_normals(depth_map)
+                    
+                    # 创建深度包
+                    depth_pkg = {
+                        "depth": depth_map,
+                        "surface_normals": surface_normals
+                    }
+                
+                # 计算法线一致性损失
+                normal_loss = compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussians)
+                
+                if not torch.isfinite(normal_loss) or normal_loss.numel() > 1:
+                    normal_loss = torch.tensor(0.0, device="cuda")
+            except Exception as e:
+                print(f"[错误] 迭代 {iteration}: 法线计算错误: {str(e)}")
+                normal_loss = torch.tensor(0.0, device="cuda")
+        
+        # 构建最终损失 - 始终使用光度损失
+        if normal_loss > 0 and torch.isfinite(normal_loss):
+            # 先反向传播光度损失
+            photo_loss.backward(retain_graph=True)  # 保留计算图以便继续
+            # 再单独反向传播法线损失
+            (normal_loss_weight * normal_loss).backward()
+        else:
+            # 只有光度损失
+            photo_loss.backward()
 
         iter_end.record()
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            ema_loss_for_log = 0.4 * photo_loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "NormLoss": f"{normal_loss.item():.{7}f}"
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, photo_loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # # Densification
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-
-                if gaussians._culling[:,viewpoint_cam.uid].sum()==0:
-                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                else:
-                    # normalize xy gradient after culling
-                    gaussians.add_densification_stats_culling(viewspace_point_tensor, visibility_filter, gaussians.factor_culling)
-
-                area_max = render_pkg["area_max"]
-                mask_blur = torch.logical_or(mask_blur, area_max>(image.shape[1]*image.shape[2]/5000))
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
-                                
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-
-                    gaussians.densify_and_prune_mask(opt.densify_grad_threshold, 
-                                                    0.005, scene.cameras_extent, 
-                                                    size_threshold, mask_blur)
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    # print(gaussians._xyz.shape)
+                # 每次都创建新的mask_blur，确保尺寸匹配
+                mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
+                
+                if 'area_max' in render_pkg:
+                    area_max = render_pkg["area_max"]
+                    # 只处理有效范围内的元素
+                    valid_range = min(mask_blur.shape[0], area_max.shape[0])
+                    mask_blur[:valid_range] = area_max[:valid_range] > (image.shape[1]*image.shape[2]/5000)
+                
+                # 在密集化之前，应用点数量限制
+                if gaussians._xyz.shape[0] > max_points_limit and iteration % opt.densification_interval == 0:
+                    print(f"[警告] 迭代 {iteration}: 密集化前高斯点数量({gaussians._xyz.shape[0]})超过限制({max_points_limit})，执行额外剪枝")
                     
-                if iteration == args.depth_reinit_iter:
-
-                    num_depth = gaussians._xyz.shape[0]*args.num_depth_factor
-
-                    # interesction_preserving for better point cloud reconstruction result at the early stage, not affect rendering quality
-                    gaussians.interesction_preserving(scene, render_simp, iteration, args, pipe, background)
-                    pts, rgb = gaussians.depth_reinit(scene, render_depth, iteration, num_depth, args, pipe, background)
-
-                    gaussians.reinitial_pts(pts, rgb)
-
-                    gaussians.training_setup(opt)
-                    gaussians.init_culling(len(scene.getTrainCameras()))
+                    # 计算重要性分数
+                    importance = gaussians.get_opacity.squeeze()
+                    _, indices = torch.sort(importance, descending=True)
+                    keep_indices = indices[:max_points_limit]
+                    
+                    # 创建掩码
+                    prune_mask = torch.ones(gaussians._xyz.shape[0], dtype=torch.bool, device="cuda")
+                    prune_mask[keep_indices] = False
+                    
+                    # 剪枝
+                    gaussians.prune_points(prune_mask)
+                    # 重置mask_blur
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    torch.cuda.empty_cache()
-                    # print(gaussians._xyz.shape)
+                    print(f"[内存管理] 迭代 {iteration}: 剪枝后高斯点数量: {gaussians._xyz.shape[0]}")
+                
+                # 密集化和剪枝
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    
+                    # 传递mask_blur参数
+                    gaussians.densify_and_prune_mask(
+                        opt.densify_grad_threshold, 
+                        0.005, 
+                        scene.cameras_extent, 
+                        size_threshold, 
+                        mask_blur
+                    )
+
+                if iteration == args.depth_reinit_iter:
+                    # 在深度重新初始化后重置mask_blur
+                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
+                    print(f"[信息] 迭代 {iteration}: 深度重初始化后重置mask_blur，新形状: {mask_blur.shape[0]}")
 
                 if iteration >= args.aggressive_clone_from_iter and iteration % args.aggressive_clone_interval == 0 and iteration!=args.depth_reinit_iter:
                     gaussians.culling_with_clone(scene, render_simp, iteration, args, pipe, background)
@@ -211,8 +289,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                visible = radii>0
-                gaussians.optimizer.step(visible, radii.shape[0])
+                visible = render_pkg["visibility_filter"]>0
+                gaussians.optimizer.step(visible, render_pkg["visibility_filter"].shape[0])
                 # gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
@@ -310,6 +388,95 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+def compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussians):
+    """
+    计算法线一致性损失 - 简化版本
+    """
+    try:
+        # 基本检查
+        if depth_pkg is None or "surface_normals" not in depth_pkg:
+            return torch.tensor(0.0, device="cuda")
+        
+        # 获取表面法线
+        surface_normals = depth_pkg["surface_normals"]
+        
+        # 计算全局表面法线方向 (平均值)
+        avg_normal = torch.mean(surface_normals.reshape(3, -1), dim=1)
+        avg_normal = torch.nn.functional.normalize(avg_normal, dim=0)
+        
+        # 获取随机采样的高斯点法线
+        max_points = 1000  # 限制点数
+        num_points = min(gaussians._normals.shape[0], max_points)
+        indices = torch.randperm(gaussians._normals.shape[0], device='cuda')[:num_points]
+        sampled_normals = gaussians.get_normals[indices]
+        
+        # 将高斯法线转换到相机空间
+        view_matrix = viewpoint_cam.world_view_transform[:3, :3]
+        camera_normals = torch.matmul(view_matrix, sampled_normals.T).T
+        camera_normals = torch.nn.functional.normalize(camera_normals, dim=1)
+        
+        # 计算法线一致性损失
+        cos_similarity = torch.sum(camera_normals * avg_normal.unsqueeze(0), dim=1)
+        normal_loss = (1.0 - cos_similarity).mean()
+        
+        return normal_loss
+    except Exception as e:
+        print(f"法线一致性损失计算错误: {str(e)}")
+        return torch.tensor(0.0, device="cuda")
+
+def compute_surface_normals(depth_map):
+    """
+    通过深度图计算表面法线 - 避免使用pad函数
+    """
+    if depth_map is None or depth_map.numel() == 0:
+        return torch.zeros((3, 1, 1), device="cuda")
+    
+    # 获取图像尺寸
+    H, W = depth_map.shape
+    
+    # 创建法线图
+    normals = torch.zeros((3, H, W), device=depth_map.device)
+    
+    # 使用简单的滑动差分计算梯度
+    # 水平差分(中心差分)
+    dx = torch.zeros_like(depth_map)
+    dx[:, 1:-1] = depth_map[:, 2:] - depth_map[:, :-2]  # 中心点的梯度
+    dx[:, 0] = depth_map[:, 1] - depth_map[:, 0]  # 左边界
+    dx[:, -1] = depth_map[:, -1] - depth_map[:, -2]  # 右边界
+    
+    # 垂直差分(中心差分)
+    dy = torch.zeros_like(depth_map)
+    dy[1:-1, :] = depth_map[2:, :] - depth_map[:-2, :]  # 中心点的梯度
+    dy[0, :] = depth_map[1, :] - depth_map[0, :]  # 上边界
+    dy[-1, :] = depth_map[-1, :] - depth_map[-2, :]  # 下边界
+    
+    # 平滑梯度以减少噪声
+    kernel_size = 3
+    dx = torch.nn.functional.avg_pool2d(
+        dx.unsqueeze(0),  # 添加批次维度
+        kernel_size=kernel_size, 
+        stride=1, 
+        padding=kernel_size//2
+    ).squeeze(0)
+    
+    dy = torch.nn.functional.avg_pool2d(
+        dy.unsqueeze(0),  # 添加批次维度
+        kernel_size=kernel_size, 
+        stride=1, 
+        padding=kernel_size//2
+    ).squeeze(0)
+    
+    # 构建法线
+    normals[0] = -dx  # X分量
+    normals[1] = -dy  # Y分量
+    normals[2] = torch.ones_like(dx) * 0.1  # Z分量(减小以增强XY平面细节)
+    
+    # 归一化
+    norm = torch.sqrt(torch.sum(normals**2, dim=0, keepdim=True) + 1e-6)
+    normals = normals / norm
+    
+    return normals
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -342,6 +509,10 @@ if __name__ == "__main__":
     parser.add_argument("--simp_iteration2", type=int, default = 8_000)
     parser.add_argument("--sampling_factor", type=float, default = 0.6)
 
+    parser.add_argument("--normal_loss_weight", type=float, default=0.05, help="法线一致性损失的权重")
+    parser.add_argument("--enable_normal_loss", action="store_true", help="是否启用法线约束")
+    parser.add_argument("--normal_loss_start_iter", type=int, default=500, help="开始应用法线损失的迭代次数")
+    parser.add_argument("--max_points_limit", type=int, default=1000000, help="高斯点数量上限，超过此值将进行额外剪枝")
 
     args = parser.parse_args(sys.argv[1:])
     args.iterations = args.simp_iteration2

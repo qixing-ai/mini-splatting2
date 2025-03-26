@@ -90,3 +90,4 @@ CUDA_VISIBLE_DEVICES=1 python msv2/train.py -s /workspace/2dgs/output -m /worksp
 
 CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs  --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000
 
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs  --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000 --enable_normal_loss

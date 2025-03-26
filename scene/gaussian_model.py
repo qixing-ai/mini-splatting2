@@ -61,7 +61,14 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
+        self.normal_activation = torch.nn.functional.normalize
 
+        # 添加安全的法线归一化函数
+        def safe_normalize(x, dim=1):
+            norm = torch.sqrt(torch.sum(x**2, dim=dim, keepdim=True).clamp(min=1e-6))
+            return x / norm
+        
+        self.normal_activation = safe_normalize
 
     def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
@@ -72,6 +79,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._normals = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -89,6 +97,7 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._normals,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -104,6 +113,7 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._opacity,
+        self._normals,
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -144,6 +154,15 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+    @property
+    def get_normals(self):
+        # 确保_normals不为空
+        if self._normals.numel() == 0 and self._xyz.numel() > 0:
+            # 动态初始化法线
+            random_normals = torch.randn((self._xyz.shape[0], 3), device="cuda")
+            self._normals = nn.Parameter(self.normal_activation(random_normals).requires_grad_(True))
+        return self.normal_activation(self._normals)
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -168,12 +187,23 @@ class GaussianModel:
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        # 随机初始化法线向量
+        random_normals = torch.randn((fused_point_cloud.shape[0], 3), device="cuda")
+        normalized_normals = self.normal_activation(random_normals)
+        
+        # 如果点云中包含法线信息，则使用点云法线
+        if hasattr(pcd, 'normals') and pcd.normals is not None:
+            pcd_normals = torch.tensor(np.asarray(pcd.normals)).float().cuda()
+            if pcd_normals.shape[0] == fused_point_cloud.shape[0]:
+                normalized_normals = torch.nn.functional.normalize(pcd_normals, dim=1)
+        
         self._xyz = nn.Parameter(fused_point_cloud.contiguous().requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._normals = nn.Parameter(normalized_normals.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
 
@@ -188,7 +218,8 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': [self._normals], 'lr': training_args.position_lr_init, "name": "normals"}
         ]
 
         self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
@@ -287,6 +318,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._normals = nn.Parameter(torch.tensor(normalized_normals, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -333,6 +365,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._normals = optimizable_tensors["normals"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -366,14 +399,20 @@ class GaussianModel:
         return optimizable_tensors
 
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_normals=None):
+        # 如果没有提供新法线，则创建随机法线
+        if new_normals is None:
+            random_normals = torch.randn((new_xyz.shape[0], 3), device="cuda")
+            new_normals = torch.nn.functional.normalize(random_normals, dim=1)
+        
         d = {"xyz": new_xyz,
-        "f_dc": new_features_dc,
-        "f_rest": new_features_rest,
-        "opacity": new_opacities,
-        "scaling" : new_scaling,
-        "rotation" : new_rotation}
-
+             "f_dc": new_features_dc,
+             "f_rest": new_features_rest,
+             "opacity": new_opacities,
+             "scaling": new_scaling,
+             "rotation": new_rotation,
+             "normals": new_normals}
+        
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -381,6 +420,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._normals = optimizable_tensors["normals"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -426,9 +466,9 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_normals = self._normals[selected_pts_mask]
 
-
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_normals)
 
         new_culling = self._culling[selected_pts_mask]
         self._culling = torch.cat((self._culling, new_culling))
@@ -455,8 +495,9 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_normals = self._normals[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normals)
 
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
         self._culling = torch.cat((self._culling, new_culling))
@@ -468,13 +509,23 @@ class GaussianModel:
 
 
 
-    def densify_and_prune_mask(self, max_grad, min_opacity, extent, max_screen_size, mask_split):
+    def densify_and_prune_mask(self, max_grad, min_opacity, extent, max_screen_size, mask_blur=None):
+        """
+        使用mask_blur执行密集化和剪枝，确保mask_blur形状正确
+        """
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split_mask(grads, max_grad, extent, mask_split)
+        
+        # 如果mask_blur不为None且形状正确，则使用它进行分裂
+        if mask_blur is not None and mask_blur.shape[0] == self._xyz.shape[0]:
+            self.densify_and_split_mask(grads, max_grad, extent, mask_blur)
+        else:
+            # 否则使用标准分裂
+            self.densify_and_split(grads, max_grad, extent)
 
+        # 剪枝过程
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
@@ -511,8 +562,9 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_normals = self._normals[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normals)
 
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
         self._culling = torch.cat((self._culling, new_culling))
@@ -806,8 +858,9 @@ class GaussianModel:
 
 
         new_rotation = self._rotation[selected_pts_mask]
+        new_normals = self._normals[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normals)
 
         new_culling = self._culling[selected_pts_mask]
         self._culling = torch.cat((self._culling, new_culling))
