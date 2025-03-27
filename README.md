@@ -88,10 +88,30 @@ python teaser.py -s <数据集路径> -m <模型路径> -i images_4 --eval --imp
 CUDA_VISIBLE_DEVICES=1 python msv2/train.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --config_path /workspace/wb-test/mini-splatting2/config/fast
 ```
 
-CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs  --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000
 
-CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs  --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000 --enable_normal_loss
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000
 
-CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000 --enable_normal_loss --normal_loss_weight 0.1 --normal_loss_start_iter 1500 --enable_depth_loss --depth_loss_weight 0.01 --depth_loss_start_iter 2500 --max_points_limit 800000
 
-CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000 --max_points_limit 800000
+### 不启用额外约束（原始训练）：
+
+```bash
+python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000
+```
+
+### 启用法线约束：
+
+```bash
+python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000 --enable_normal_loss --normal_loss_weight 0.05
+```
+
+### 启用深度集中约束：
+
+```bash
+python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000 --enable_depth_loss --depth_loss_weight 0.01
+```
+
+### 同时启用两种约束：
+
+```bash
+python teaser.py -s /workspace/2dgs/output -m /workspace/2dgs/output/3dgs --imp_metric outdoor --depth_reinit_iter 3000 --simp_iteration2 18000 --enable_normal_loss --normal_loss_weight 0.05 --enable_depth_loss --depth_loss_weight 0.01
+```
