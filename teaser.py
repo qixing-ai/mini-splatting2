@@ -220,7 +220,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # 修改loss变量以便与原始代码兼容
             loss = total_loss
         else:
-            # 原始代码路径
+            # 原始代码路径 
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
             loss.backward()
             
