@@ -70,46 +70,72 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
     gaussians.init_culling(len(scene.getTrainCameras()))
     
-    # 添加内存管理参数
-    memory_cleanup_interval = 100
+    # 获取损失相关参数
+    enable_normal_loss = getattr(args, 'enable_normal_loss', False)
+    enable_depth_loss = getattr(args, 'enable_depth_loss', False)
+    
+    # 重要修复：总是获取max_points_limit参数
     max_points_limit = getattr(args, 'max_points_limit', 1000000)
     
-    # 设置损失权重参数
-    normal_loss_weight = getattr(args, 'normal_loss_weight', 0.1)
-    depth_loss_weight = getattr(args, 'depth_loss_weight', 0.01)
-    enable_normal_loss = getattr(args, 'enable_normal_loss', True)
-    enable_depth_loss = getattr(args, 'enable_depth_loss', True)
-    normal_loss_start_iter = getattr(args, 'normal_loss_start_iter', 1000)
-    depth_loss_start_iter = getattr(args, 'depth_loss_start_iter', 2000)
-    normal_loss_threshold = getattr(args, 'normal_loss_threshold', 2.0)
+    # 内存管理参数
+    memory_cleanup_interval = getattr(args, 'memory_cleanup_interval', 100)
     
-    # 打印初始配置信息
-    print(f"法线约束: 启用={enable_normal_loss}, 权重={normal_loss_weight}, 开始迭代={normal_loss_start_iter}, 阈值={normal_loss_threshold}")
-    print(f"深度集中约束: 启用={enable_depth_loss}, 权重={depth_loss_weight}, 开始迭代={depth_loss_start_iter}")
-
-    # 自动调整法线损失权重
-    if enable_normal_loss and getattr(args, 'normal_loss_auto_adjust', True):
-        adjusted_normal_weight = normal_loss_weight * 0.5
-        print(f"法线约束权重自动调整: {normal_loss_weight} -> {adjusted_normal_weight}")
-        normal_loss_weight = adjusted_normal_weight
-
-    # 初始化total_loss变量
-    total_loss = torch.tensor(0.0, device="cuda")
-
-    for iteration in range(first_iter, opt.iterations + 1):   
-        # 确保在每次迭代开始时记录开始事件
-        iter_start.record()
-
-        if iteration % memory_cleanup_interval == 0:
-            torch.cuda.empty_cache()
-            print(f"[内存管理] 迭代 {iteration}: 强制清理GPU缓存")
+    # 只有在启用额外损失时才设置这些参数
+    if enable_normal_loss or enable_depth_loss:
+        # 损失权重参数
+        normal_loss_weight = getattr(args, 'normal_loss_weight', 0.1)
+        depth_loss_weight = getattr(args, 'depth_loss_weight', 0.01)
+        normal_loss_start_iter = getattr(args, 'normal_loss_start_iter', 1000)
+        depth_loss_start_iter = getattr(args, 'depth_loss_start_iter', 2000)
+        normal_loss_threshold = getattr(args, 'normal_loss_threshold', 2.0)
+        print_loss_interval = getattr(args, 'print_loss_interval', 100)
         
-        # 限制高斯点数量以防止内存爆炸
-        if gaussians._xyz.shape[0] > max_points_limit:
+        # 打印配置信息
+        print(f"法线约束: 启用={enable_normal_loss}, 权重={normal_loss_weight}, 开始迭代={normal_loss_start_iter}")
+        print(f"深度集中约束: 启用={enable_depth_loss}, 权重={depth_loss_weight}, 开始迭代={depth_loss_start_iter}")
+        
+        # 自动调整法线损失权重
+        if enable_normal_loss and getattr(args, 'normal_loss_auto_adjust', True):
+            adjusted_normal_weight = normal_loss_weight * 0.5
+            print(f"法线约束权重自动调整: {normal_loss_weight} -> {adjusted_normal_weight}")
+            normal_loss_weight = adjusted_normal_weight
+    else:
+        print("使用原始训练流程（无额外约束）")
+    
+    # 打印点数限制信息
+    print(f"高斯点数量上限：{max_points_limit}")
+    
+    # 修复：禁用过于频繁的CUDA事件记录，改为使用Python的时间测量
+    use_cuda_events = False  # 关闭CUDA事件计时，使用Python时间代替
+    start_time = time.time()
+
+    for iteration in range(first_iter, opt.iterations + 1):
+        # 修复：只在需要时记录CUDA事件
+        if use_cuda_events:
+            iter_start.record()
+        else:
+            # 使用Python时间替代CUDA事件
+            current_time = time.time()
+            elapsed_ms = (current_time - start_time) * 1000  # 转换为毫秒
+            start_time = current_time
+        
+        # 内存管理 - 减少频率并确保同步
+        if iteration % memory_cleanup_interval == 0:
+            # 重要：在清理缓存前同步
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # 重要：清理后也同步
+            torch.cuda.synchronize()
+        
+        # 限制高斯点数量 - 对所有训练模式有效，但减少频率
+        if gaussians._xyz.shape[0] > max_points_limit and iteration % 10 == 0:  # 降低剪枝频率
             print(f"[警告] 迭代 {iteration}: 高斯点数量({gaussians._xyz.shape[0]})超过限制({max_points_limit})，执行额外剪枝")
+            
+            # 同步GPU，确保之前的操作完成
+            torch.cuda.synchronize()
+            
             # 计算重要性分数
             importance = gaussians.get_opacity.squeeze()
-            # 保留最重要的点
             _, indices = torch.sort(importance, descending=True)
             keep_indices = indices[:max_points_limit]
             
@@ -117,17 +143,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mask = torch.zeros(gaussians._xyz.shape[0], dtype=torch.bool, device="cuda")
             mask[keep_indices] = True
             
-            # 记录剪枝前的点数
-            original_point_count = gaussians._xyz.shape[0]
-            
             # 剪枝
             gaussians.prune_points(~mask)
             
             # 重置mask_blur以匹配新的点数
             mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
             
+            # 同步GPU，确保剪枝操作完成
+            torch.cuda.synchronize()
+            
             print(f"[内存管理] 迭代 {iteration}: 剪枝后高斯点数量: {gaussians._xyz.shape[0]}")
-        
+
+        # 图形界面处理（保持不变）
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -143,9 +170,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
 
-        # 确保在此处记录开始事件
-        iter_start.record()
-
+        # 更新学习率
         gaussians.update_learning_rate(iteration)
 
         if iteration % 1000 == 0 and iteration>args.simp_iteration1:
@@ -156,82 +181,64 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
         render_pkg = render_imp(viewpoint_cam, gaussians, pipe, background, culling=gaussians._culling[:,viewpoint_cam.uid])
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        # 计算原始光度损失
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         photo_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        
-        # 初始化约束损失
-        normal_loss = torch.tensor(0.0, device="cuda")
-        depth_loss = torch.tensor(0.0, device="cuda")
-        
-        # 计算额外约束损失
-        if (enable_normal_loss and iteration > normal_loss_start_iter) or (enable_depth_loss and iteration > depth_loss_start_iter):
-            try:
-                with torch.no_grad():
-                    # 从渲染图像获取深度估计
-                    rgb = render_pkg["render"].detach()
-                    depth_map = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-                    
-                    # 计算表面法线
-                    surface_normals = compute_surface_normals(depth_map)
-                    
-                    # 创建深度包
-                    depth_pkg = {
-                        "depth": depth_map,
-                        "surface_normals": surface_normals
-                    }
-                
-                # 计算法线一致性损失
-                if enable_normal_loss and iteration > normal_loss_start_iter:
-                    normal_loss = compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussians)
-                    if not torch.isfinite(normal_loss) or normal_loss > normal_loss_threshold:
-                        print(f"[警告] 迭代 {iteration}: 法线损失值异常({normal_loss.item():.4f})，使用0.0替代")
-                        normal_loss = torch.tensor(0.0, device="cuda")
-                
-                # 计算深度集中损失
-                if enable_depth_loss and iteration > depth_loss_start_iter:
-                    depth_loss = compute_simplified_depth_concentration_loss(depth_pkg)
-                    if not torch.isfinite(depth_loss) or depth_loss > 1.0:
-                        print(f"[警告] 迭代 {iteration}: 深度损失值异常({depth_loss.item():.4f})，使用0.0替代")
-                        depth_loss = torch.tensor(0.0, device="cuda")
-            except Exception as e:
-                print(f"[错误] 迭代 {iteration}: 约束计算错误: {str(e)}")
-                normal_loss = torch.tensor(0.0, device="cuda")
-                depth_loss = torch.tensor(0.0, device="cuda")
-                torch.cuda.empty_cache()
 
-        # 组合总损失
-        total_loss = photo_loss
-        normal_term = torch.tensor(0.0, device="cuda")
-        depth_term = torch.tensor(0.0, device="cuda")
-        
-        if normal_loss > 0:
-            normal_term = normal_loss_weight * normal_loss
-            total_loss = total_loss + normal_term
-        if depth_loss > 0:
-            depth_term = depth_loss_weight * depth_loss
-            total_loss = total_loss + depth_term
-        
-        # 反向传播
-        total_loss.backward()
-        
-        # 确保在结束时记录结束事件
-        iter_end.record()
-        
-        # 同步CUDA流，确保事件被正确记录
-        torch.cuda.synchronize()
+        if enable_normal_loss or enable_depth_loss:
+            normal_loss = torch.tensor(0.0, device="cuda")
+            depth_loss = torch.tensor(0.0, device="cuda")
+            
+            if (enable_normal_loss and iteration > normal_loss_start_iter) or (enable_depth_loss and iteration > depth_loss_start_iter):
+                try:
+                    with torch.no_grad():
+                        rgb = render_pkg["render"].detach()
+                        depth_map = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+                        
+                        surface_normals = compute_surface_normals(depth_map)
+                        
+                        depth_pkg = {
+                            "depth": depth_map,
+                            "surface_normals": surface_normals
+                        }
+                    
+                    if enable_normal_loss and iteration > normal_loss_start_iter:
+                        normal_loss = compute_normal_consistency_loss(render_pkg, depth_pkg, viewpoint_cam, gaussians)
+                        if not torch.isfinite(normal_loss) or normal_loss > normal_loss_threshold:
+                            print(f"[警告] 迭代 {iteration}: 法线损失值异常({normal_loss.item():.4f})，使用0.0替代")
+                            normal_loss = torch.tensor(0.0, device="cuda")
+                    
+                    if enable_depth_loss and iteration > depth_loss_start_iter:
+                        depth_loss = compute_simplified_depth_concentration_loss(depth_pkg)
+                        if not torch.isfinite(depth_loss) or depth_loss > 1.0:
+                            print(f"[警告] 迭代 {iteration}: 深度损失值异常({depth_loss.item():.4f})，使用0.0替代")
+                            depth_loss = torch.tensor(0.0, device="cuda")
+                except Exception as e:
+                    print(f"[错误] 迭代 {iteration}: 约束计算错误: {str(e)}")
+                    normal_loss = torch.tensor(0.0, device="cuda")
+                    depth_loss = torch.tensor(0.0, device="cuda")
+                    torch.cuda.empty_cache()
 
-        with torch.no_grad():
-            # 进度条更新
+            total_loss = photo_loss
+            normal_term = torch.tensor(0.0, device="cuda")
+            depth_term = torch.tensor(0.0, device="cuda")
+            
+            if normal_loss > 0:
+                normal_term = normal_loss_weight * normal_loss
+                total_loss = total_loss + normal_term
+            if depth_loss > 0:
+                depth_term = depth_loss_weight * depth_loss
+                total_loss = total_loss + depth_term
+
+            total_loss.backward()
+            
             ema_loss_for_log = 0.4 * total_loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({
@@ -240,63 +247,87 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "DepthLoss": f"{depth_loss.item():.{4}f}" if depth_loss > 0 else "0.0"
                 })
                 progress_bar.update(10)
+            
+            if iteration % print_loss_interval == 0:
+                print(f"[迭代 {iteration}] 光度损失: {photo_loss.item():.4f}, "
+                    f"法线损失: {normal_loss.item():.4f} (权重项: {normal_term.item():.4f}), "
+                    f"深度损失: {depth_loss.item():.4f} (权重项: {depth_term.item():.4f}), "
+                    f"总损失: {total_loss.item():.4f}")
+        else:
+            loss = photo_loss
+            loss.backward()
+            
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # 记录和保存（确保事件已被记录）
+        # 修复：只在使用CUDA事件时记录结束事件
+        if use_cuda_events:
+            iter_end.record()
+            # 重要修复：确保CUDA操作同步
+            torch.cuda.synchronize()
+
+        with torch.no_grad():
+            # 记录和保存
             try:
-                # 确保两个事件都已被记录
-                elapsed_time = iter_start.elapsed_time(iter_end) if iteration > 1 else 0.0
-                # 传入法线损失和深度损失
-                training_report(tb_writer, iteration, Ll1, total_loss, l1_loss, elapsed_time, 
-                               testing_iterations, scene, render, (pipe, background), 
-                               normal_loss=normal_loss, depth_loss=depth_loss)
-            except RuntimeError as e:
-                print(f"[警告] 迭代 {iteration}: 无法计算时间: {str(e)}")
-                # 跳过时间记录，直接传递0.0
-                training_report(tb_writer, iteration, Ll1, total_loss, l1_loss, 0.0, 
-                               testing_iterations, scene, render, (pipe, background),
-                               normal_loss=normal_loss, depth_loss=depth_loss)
+                # 使用Python时间或CUDA事件，取决于设置
+                if use_cuda_events:
+                    elapsed_time = iter_start.elapsed_time(iter_end) if iteration > 1 else 0.0
+                else:
+                    elapsed_time = elapsed_ms  # 使用Python计时器的结果
                 
+                if enable_normal_loss or enable_depth_loss:
+                    training_report(tb_writer, iteration, Ll1, total_loss, l1_loss, elapsed_time, 
+                                testing_iterations, scene, render, (pipe, background),
+                                normal_loss=normal_loss if enable_normal_loss else None,
+                                depth_loss=depth_loss if enable_depth_loss else None)
+                else:
+                    training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_time, 
+                                  testing_iterations, scene, render, (pipe, background))
+            except Exception as e:
+                print(f"[警告] 迭代 {iteration}: 时间计算错误: {str(e)}")
+                # 使用零替代
+                if enable_normal_loss or enable_depth_loss:
+                    training_report(tb_writer, iteration, Ll1, total_loss, l1_loss, 0.0, 
+                                testing_iterations, scene, render, (pipe, background),
+                                normal_loss=normal_loss if enable_normal_loss else None,
+                                depth_loss=depth_loss if enable_depth_loss else None)
+                else:
+                    training_report(tb_writer, iteration, Ll1, loss, l1_loss, 0.0, 
+                                  testing_iterations, scene, render, (pipe, background))
+
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # # Densification
             if iteration < opt.densify_until_iter:
-                # 每次都创建新的mask_blur，确保尺寸匹配
                 mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
                 
                 if 'area_max' in render_pkg:
                     area_max = render_pkg["area_max"]
-                    # 只处理有效范围内的元素
                     valid_range = min(mask_blur.shape[0], area_max.shape[0])
                     mask_blur[:valid_range] = area_max[:valid_range] > (image.shape[1]*image.shape[2]/5000)
                 
-                # 在密集化之前，应用点数量限制
                 if gaussians._xyz.shape[0] > max_points_limit and iteration % opt.densification_interval == 0:
                     print(f"[警告] 迭代 {iteration}: 密集化前高斯点数量({gaussians._xyz.shape[0]})超过限制({max_points_limit})，执行额外剪枝")
                     
-                    # 计算重要性分数
                     importance = gaussians.get_opacity.squeeze()
                     _, indices = torch.sort(importance, descending=True)
                     keep_indices = indices[:max_points_limit]
                     
-                    # 创建掩码
                     prune_mask = torch.ones(gaussians._xyz.shape[0], dtype=torch.bool, device="cuda")
                     prune_mask[keep_indices] = False
                     
-                    # 剪枝
                     gaussians.prune_points(prune_mask)
-                    # 重置mask_blur
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
                     print(f"[内存管理] 迭代 {iteration}: 剪枝后高斯点数量: {gaussians._xyz.shape[0]}")
                 
-                # 密集化和剪枝
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
-                    # 传递mask_blur参数
                     gaussians.densify_and_prune_mask(
                         opt.densify_grad_threshold, 
                         0.005, 
@@ -306,7 +337,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     )
 
                 if iteration == args.depth_reinit_iter:
-                    # 在深度重新初始化后重置mask_blur
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
                     print(f"[信息] 迭代 {iteration}: 深度重初始化后重置mask_blur，新形状: {mask_blur.shape[0]}")
 
@@ -314,10 +344,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.culling_with_clone(scene, render_simp, iteration, args, pipe, background)
                     torch.cuda.empty_cache()
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')
-                    # print(gaussians._xyz.shape)
 
             if iteration == args.simp_iteration1:
-
                 path_save = r'./teaser/%d_d.ply'%iteration
                 gs2ply(gaussians, path_save)
 
@@ -327,16 +355,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 gaussians.training_setup(opt)
                 torch.cuda.empty_cache()
-                # print(gaussians._xyz.shape)
 
                 path_save = r'./teaser/%d_s.ply'%iteration
                 gs2ply(gaussians, path_save)                
             
-
             if iteration == args.simp_iteration2:
                 gaussians.culling_with_interesction_preserving(scene, render_simp, iteration, args, pipe, background)
                 torch.cuda.empty_cache()
-                # print(gaussians._xyz.shape)
 
                 path_save = r'./teaser/%d.ply'%iteration
                 gs2ply(gaussians, path_save)                
@@ -344,13 +369,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == (args.simp_iteration2+opt.iterations)//2:
                 gaussians.init_culling(len(scene.getTrainCameras()))
 
-
-
-            # Optimizer step
             if iteration < opt.iterations:
                 visible = render_pkg["visibility_filter"]>0
                 gaussians.optimizer.step(visible, render_pkg["visibility_filter"].shape[0])
-                # gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
@@ -395,7 +416,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
-        # 添加法线和深度损失记录
+        # 只有在提供额外损失时才记录它们
         if normal_loss is not None:
             tb_writer.add_scalar('train_loss_patches/normal_loss', normal_loss.item(), iteration)
         if depth_loss is not None:
@@ -653,6 +674,7 @@ if __name__ == "__main__":
     parser.add_argument("--normal_loss_auto_adjust", action="store_true", default=True, help="自动调整法线损失权重")
     parser.add_argument("--normal_loss_threshold", type=float, default=2.0, help="法线损失异常值阈值")
     parser.add_argument("--print_loss_interval", type=int, default=100, help="打印详细损失信息的间隔")
+    parser.add_argument("--memory_cleanup_interval", type=int, default=100, help="内存清理间隔")
 
     args = parser.parse_args(sys.argv[1:])
     args.iterations = args.simp_iteration2
